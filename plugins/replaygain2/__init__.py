@@ -63,11 +63,12 @@ from picard.formats import (
 )
 from picard.album import Album
 from picard.track import Track, NonAlbumTrack
+from picard.file import File
 from picard.util import thread
 from picard.ui.options import register_options_page, OptionsPage
 from picard.config import TextOption, BoolOption, IntOption, config
-from picard.ui.itemviews import (BaseAction, register_track_action,
-                                 register_album_action)
+from picard.ui.itemviews import (BaseAction, register_track_action, 
+                                 register_album_action, register_file_action)
 from picard.plugins.replaygain2.ui_options_replaygain2 import Ui_ReplayGain2OptionsPage
 
 
@@ -193,7 +194,7 @@ def update_metadata(metadata, track_result, album_result, is_nat, opus_mode):
 def calculate_replaygain(tracks, options):
 
     # Make sure files are of supported type, build file list
-    files = list()
+    filenames = list()
     valid_tracks = list()
     for track in tracks:
         if not track.files:
@@ -201,10 +202,10 @@ def calculate_replaygain(tracks, options):
         file = track.files[0]
         if not isinstanceany(file, SUPPORTED_FORMATS):
             raise Exception(f"ReplayGain 2.0: File '{file.filename}' is of unsupported format")
-        files.append(file.filename)
+        filenames.append(file.filename)
         valid_tracks.append(track)
 
-    call = [config.setting["rsgain_command"]] + options + files
+    call = [config.setting["rsgain_command"]] + options + filenames
     for item in call:
         item.encode("utf-8")
 
@@ -271,13 +272,117 @@ def calculate_replaygain(tracks, options):
                 opus_mode
             )
 
+def calculate_replaygain_files(files, options):
+
+    filenames = [f.filename for f in files]
+    call = [config.setting["rsgain_command"]] + options + filenames
+    for item in call:
+        item.encode("utf-8")
+
+    # Prevent an unwanted console spawn in Windows
+    si = None
+    if (os.name == "nt"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+
+    # Execute the scan with rsgain
+    lines = list()
+    with subprocess.Popen(  # nosec: B603
+        call,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        startupinfo=si,
+        encoding="utf-8",
+        text=True
+    ) as process:
+        (output, _unused) = process.communicate()
+        rc = process.poll()
+        if rc:
+            raise Exception(f'ReplayGain 2.0: rsgain returned non-zero code ({rc})')
+        log.debug(output)
+        lines = output.splitlines()
+    album_tags = config.setting["album_tags"]
+
+    # Make sure the number of rows in the output is what we expected
+    if (len(lines) !=
+        1                            # Table header
+        + len(files)                 # 1 row per track
+        + 1 if album_tags else 0):   # Album result
+        raise Exception(f"ReplayGain 2.0: Unexpected output from rsgain: {lines}")
+    lines.pop(0) # Don't care about the table header
+
+    # Parse album result
+    album_result = None
+    if album_tags:
+        album_result = parse_result(lines[-1])
+        lines.pop(-1)
+
+    # Parse track results
+    results = list()
+    for line in lines:
+        result = parse_result(line)
+        if result is None:
+            raise Exception("ReplayGain 2.0: Failed to parse result")
+        results.append(result)
+
+    # Update track metadata with results
+    if isinstance(files[0], OggOpusFile):
+        opus_mode = config.setting["opus_mode"]
+    else:
+        opus_mode = OpusMode.STANDARD
+
+    for i, file in enumerate(files):
+        update_metadata(
+            file.metadata,
+            results[i],
+            album_result,
+            True,
+            opus_mode
+        )
+
 
 def isinstanceany(obj, types):
     return any(isinstance(obj, t) for t in types)
 
+class ScanFiles(BaseAction):
+    NAME = "Calculate Replay&Gain (file)..."
 
+    def callback(self, objs):
+        if not rsgain_found(self.config.setting["rsgain_command"], self.tagger.window):
+            return        
+        files = []
+        for obj in objs:
+            if isinstance(obj, Track):
+                for file in obj.linked_files:
+                    files.append(file)
+            elif isinstance(obj, File):
+                files.append(obj)
+        self.options = build_options(self.config)
+        num_files = len(files)
+        if num_files == 1:
+            self.tagger.window.set_statusbar_message(
+                'Calculating ReplayGain for %s...', {files[0].filename}
+            )
+        else:
+            self.tagger.window.set_statusbar_message(
+                'Calculating ReplayGain for %i files...', num_files
+            )
+        thread.run_task(
+            partial(calculate_replaygain_files, files, self.options),
+            partial(self._replaygain_callback, files)
+        )
+
+    def _replaygain_callback(self, files, result=None, error=None):
+        if error is None:
+            for file in files:
+                file.update()
+            self.tagger.window.set_statusbar_message('ReplayGain successfully calculated.')
+        else:
+            self.tagger.window.set_statusbar_message('Could not calculate ReplayGain.')
+            
 class ScanTracks(BaseAction):
-    NAME = "Calculate Replay&Gain..."
+    NAME = "Calculate Replay&Gain (track)..."
 
     def callback(self, objs):
         if not rsgain_found(self.config.setting["rsgain_command"], self.tagger.window):
@@ -310,7 +415,7 @@ class ScanTracks(BaseAction):
 
 
 class ScanAlbums(BaseAction):
-    NAME = "Calculate Replay&Gain..."
+    NAME = "Calculate Replay&Gain (album)..."
 
     def callback(self, objs):
         if not rsgain_found(self.config.setting["rsgain_command"], self.tagger.window):
@@ -428,6 +533,7 @@ class ReplayGain2OptionsPage(OptionsPage):
             self.ui.rsgain_command.setText(path)
 
 
+register_file_action(ScanFiles())
 register_track_action(ScanTracks())
 register_album_action(ScanAlbums())
 register_options_page(ReplayGain2OptionsPage)
